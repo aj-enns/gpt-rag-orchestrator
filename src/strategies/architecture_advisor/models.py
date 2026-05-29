@@ -38,6 +38,17 @@ class ClassifierResult:
 
 
 @dataclass
+class GateResult:
+    """Outcome of the requirements-qualification gate."""
+
+    ready: bool
+    questions: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+    consolidated_description: str = ""
+    raw_response: Optional[str] = None
+
+
+@dataclass
 class ArchitectureOption:
     title: str
     url: str

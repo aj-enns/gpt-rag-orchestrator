@@ -34,9 +34,11 @@ from dependencies import get_config
 from .agent_strategies import AgentStrategies
 from .base_agent_strategy import BaseAgentStrategy
 from .architecture_advisor.classifier import AINeedsClassifier
+from .architecture_advisor.gate import RequirementsGate
 from .architecture_advisor.models import (
     AINeedDecision,
     ClassifierResult,
+    GateResult,
     Recommendation,
 )
 from .architecture_advisor.synthesizer import RecommendationSynthesizer
@@ -64,7 +66,16 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         synthesiser_deployment = cfg.get(
             "ARCH_ADVISOR_SYNTHESIZER_DEPLOYMENT", chat_default
         )
+        gate_deployment = cfg.get(
+            "ARCH_ADVISOR_GATE_DEPLOYMENT", chat_default
+        )
 
+        self._gate = RequirementsGate(
+            azure_endpoint=chat_endpoint,
+            deployment=gate_deployment,
+            sync_credential=self._sync_credential,
+            api_version=self.openai_api_version,
+        )
         self._classifier = AINeedsClassifier(
             azure_endpoint=chat_endpoint,
             deployment=classifier_deployment,
@@ -85,32 +96,106 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         self._confidence_threshold = float(
             cfg.get("ARCH_ADVISOR_CLASSIFIER_THRESHOLD", 0.6)
         )
+        # How many rounds of clarifying questions before recommending anyway.
+        self._max_question_rounds = int(
+            cfg.get("ARCH_ADVISOR_MAX_QUESTION_ROUNDS", 2)
+        )
 
     # -------------------------------------------------------- BaseAgentStrategy
 
     async def initiate_agent_flow(self, user_message: str) -> AsyncIterator[str]:
         logger.info("[arch-advisor] user_message=%r", user_message[:120])
 
-        verdict = await self._classifier.classify(user_message)
+        # --- Load / initialise multi-turn state from the conversation doc.
+        # The orchestrator persists `self.conversation` after every turn, so
+        # anything stored under "arch_advisor" survives across turns.
+        state = self._load_state()
+        state["dialog"].append({"role": "user", "content": user_message})
+
+        # --- Qualifying gate: ask first, recommend later.
+        gate = await self._gate.evaluate(state["dialog"])
+        logger.info(
+            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d",
+            gate.ready,
+            state["rounds_asked"],
+            len(gate.questions),
+        )
+
+        if not gate.ready and state["rounds_asked"] < self._max_question_rounds:
+            state["rounds_asked"] += 1
+            questions_md = self._render_questions(gate)
+            state["dialog"].append(
+                {"role": "assistant", "content": questions_md}
+            )
+            self._save_state(state)
+            yield questions_md
+            return
+
+        # --- Enough info (or round cap reached): recommend.
+        description = gate.consolidated_description or user_message
+        logger.info(
+            "[arch-advisor] recommending on consolidated description (%d chars)",
+            len(description),
+        )
+
+        verdict = await self._classifier.classify(description)
         logger.info(
             "[arch-advisor] classifier: decision=%s confidence=%.2f",
             verdict.decision.value,
             verdict.confidence,
         )
 
-        candidates = await self._retrieve(user_message, verdict)
+        candidates = await self._retrieve(description, verdict)
         logger.info("[arch-advisor] retrieved %d candidates", len(candidates))
 
         recommendation = await self._synthesiser.synthesize(
-            description=user_message,
+            description=description,
             classifier=verdict,
             candidates=candidates,
         )
 
-        # Stream a single complete chunk. The orchestrator's response handler
-        # already expects async iteration, so this keeps the contract simple
-        # while letting Phase 2 stream the synthesiser tokens directly.
-        yield self._render_markdown(recommendation)
+        rendered = self._render_markdown(recommendation)
+        state["dialog"].append({"role": "assistant", "content": rendered})
+        # Reset the question budget so a follow-up inquiry can qualify afresh.
+        state["rounds_asked"] = 0
+        self._save_state(state)
+        yield rendered
+
+    # ------------------------------------------------------------ state helpers
+
+    def _load_state(self) -> dict:
+        conversation = getattr(self, "conversation", None)
+        if not isinstance(conversation, dict):
+            return {"dialog": [], "rounds_asked": 0}
+        state = conversation.get("arch_advisor")
+        if not isinstance(state, dict):
+            state = {"dialog": [], "rounds_asked": 0}
+        state.setdefault("dialog", [])
+        state.setdefault("rounds_asked", 0)
+        return state
+
+    def _save_state(self, state: dict) -> None:
+        conversation = getattr(self, "conversation", None)
+        if isinstance(conversation, dict):
+            conversation["arch_advisor"] = state
+
+    # --------------------------------------------------------------- rendering
+
+    @staticmethod
+    def _render_questions(gate: GateResult) -> str:
+        lines = [
+            "Before I recommend an architecture, I need a little more detail "
+            "so the recommendation actually fits your scenario:",
+            "",
+        ]
+        for i, q in enumerate(gate.questions, start=1):
+            lines.append(f"{i}. {q}")
+        lines.append("")
+        lines.append(
+            "_Answer what you can — even rough estimates help. "
+            "I'll recommend a pattern as soon as I have enough to go on._"
+        )
+        return "\n".join(lines)
 
     # ----------------------------------------------------------------- retrieve
 
