@@ -81,6 +81,9 @@ class RequirementsGate:
                 messages=messages,
                 temperature=self._temperature,
                 response_format={"type": "json_object"},
+                reasoning_effort="low",
+                max_completion_tokens=2000,
+                timeout=45,
             )
         except Exception:
             logger.exception("Requirements gate LLM call failed")

@@ -148,11 +148,16 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         candidates = await self._retrieve(description, verdict)
         logger.info("[arch-advisor] retrieved %d candidates", len(candidates))
 
+        # Surface immediate progress so the UI isn't blank while the
+        # synthesiser (a reasoning model) composes the recommendation.
+        yield f"Analyzing {len(candidates)} candidate architectures\u2026\n\n"
+
         recommendation = await self._synthesiser.synthesize(
             description=description,
             classifier=verdict,
             candidates=candidates,
         )
+        logger.info("[arch-advisor] synthesis complete; rendering recommendation")
 
         rendered = self._render_markdown(recommendation)
         state["dialog"].append({"role": "assistant", "content": rendered})

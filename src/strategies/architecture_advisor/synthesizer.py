@@ -61,6 +61,9 @@ class RecommendationSynthesizer:
                 ],
                 temperature=self._temperature,
                 response_format={"type": "json_object"},
+                reasoning_effort="low",
+                max_completion_tokens=4000,
+                timeout=60,
             )
         except Exception:
             logger.exception("Synthesizer LLM call failed")
