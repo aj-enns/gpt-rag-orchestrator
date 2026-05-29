@@ -138,6 +138,13 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
             len(description),
         )
 
+        # Emit progress immediately so the user sees activity right away — the
+        # classify + retrieve + synthesise steps below take ~30s combined.
+        yield (
+            "Got it \u2014 that's enough to go on. Analyzing Azure architecture "
+            "options and composing a recommendation\u2026\n\n"
+        )
+
         verdict = await self._classifier.classify(description)
         logger.info(
             "[arch-advisor] classifier: decision=%s confidence=%.2f",
@@ -147,10 +154,6 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
 
         candidates = await self._retrieve(description, verdict)
         logger.info("[arch-advisor] retrieved %d candidates", len(candidates))
-
-        # Surface immediate progress so the UI isn't blank while the
-        # synthesiser (a reasoning model) composes the recommendation.
-        yield f"Analyzing {len(candidates)} candidate architectures\u2026\n\n"
 
         recommendation = await self._synthesiser.synthesize(
             description=description,
