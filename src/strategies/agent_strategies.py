@@ -10,3 +10,4 @@ class AgentStrategies(Enum):
     MAF_LITE           = "maf_lite"
     MULTIMODAL         = "multimodal"
     NL2SQL             = "nl2sql"
+    ARCHITECTURE_ADVISOR = "architecture_advisor"

@@ -1,0 +1,224 @@
+"""Architecture Advisor strategy.
+
+Flow
+----
+1. Run the AI Needs Classifier (separate LLM call).
+2. Retrieve matching patterns from the Architecture Center AI Search index,
+   filtered by the classifier verdict (or unfiltered if confidence is low).
+3. Ask the synthesiser to produce a structured recommendation.
+4. Yield a markdown response chunk for the UI.
+
+Activation: set ``AGENT_STRATEGY=architecture_advisor`` in Azure App
+Configuration (label ``gpt-rag``).
+
+Required App Configuration keys (defaults shown):
+    ARCH_ADVISOR_CLASSIFIER_DEPLOYMENT       (fallback: CHAT_DEPLOYMENT_NAME)
+    ARCH_ADVISOR_SYNTHESIZER_DEPLOYMENT      (fallback: CHAT_DEPLOYMENT_NAME)
+    ARCH_ADVISOR_CLASSIFIER_THRESHOLD        0.6
+    ARCH_ADVISOR_TOP_K                       6
+    SEARCH_ARCHITECTURE_INDEX_NAME           architecture-{token}
+    SEARCH_SERVICE_QUERY_ENDPOINT
+    AI_FOUNDRY_ACCOUNT_ENDPOINT
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import AsyncIterator, List, Optional
+
+from azure.search.documents.aio import SearchClient
+from azure.search.documents.models import VectorizableTextQuery
+
+from dependencies import get_config
+
+from .agent_strategies import AgentStrategies
+from .base_agent_strategy import BaseAgentStrategy
+from .architecture_advisor.classifier import AINeedsClassifier
+from .architecture_advisor.models import (
+    AINeedDecision,
+    ClassifierResult,
+    Recommendation,
+)
+from .architecture_advisor.synthesizer import RecommendationSynthesizer
+
+logger = logging.getLogger(__name__)
+
+
+class ArchitectureAdvisorStrategy(BaseAgentStrategy):
+    """Classifier-first architecture advisor agent strategy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        cfg = get_config()
+        self.strategy_type = AgentStrategies.ARCHITECTURE_ADVISOR
+
+        # Sync credential is required for the openai bearer token provider.
+        self._sync_credential = cfg.credential
+
+        # Endpoints + deployments.
+        chat_endpoint = cfg.get("AI_FOUNDRY_ACCOUNT_ENDPOINT")
+        chat_default = cfg.get("CHAT_DEPLOYMENT_NAME")
+        classifier_deployment = cfg.get(
+            "ARCH_ADVISOR_CLASSIFIER_DEPLOYMENT", chat_default
+        )
+        synthesiser_deployment = cfg.get(
+            "ARCH_ADVISOR_SYNTHESIZER_DEPLOYMENT", chat_default
+        )
+
+        self._classifier = AINeedsClassifier(
+            azure_endpoint=chat_endpoint,
+            deployment=classifier_deployment,
+            sync_credential=self._sync_credential,
+            api_version=self.openai_api_version,
+        )
+        self._synthesiser = RecommendationSynthesizer(
+            azure_endpoint=chat_endpoint,
+            deployment=synthesiser_deployment,
+            sync_credential=self._sync_credential,
+            api_version=self.openai_api_version,
+        )
+
+        # Retrieval config.
+        self._search_endpoint = cfg.get("SEARCH_SERVICE_QUERY_ENDPOINT")
+        self._index_name = cfg.get("SEARCH_ARCHITECTURE_INDEX_NAME", "architecture")
+        self._top_k = int(cfg.get("ARCH_ADVISOR_TOP_K", 6))
+        self._confidence_threshold = float(
+            cfg.get("ARCH_ADVISOR_CLASSIFIER_THRESHOLD", 0.6)
+        )
+
+    # -------------------------------------------------------- BaseAgentStrategy
+
+    async def initiate_agent_flow(self, user_message: str) -> AsyncIterator[str]:
+        logger.info("[arch-advisor] user_message=%r", user_message[:120])
+
+        verdict = await self._classifier.classify(user_message)
+        logger.info(
+            "[arch-advisor] classifier: decision=%s confidence=%.2f",
+            verdict.decision.value,
+            verdict.confidence,
+        )
+
+        candidates = await self._retrieve(user_message, verdict)
+        logger.info("[arch-advisor] retrieved %d candidates", len(candidates))
+
+        recommendation = await self._synthesiser.synthesize(
+            description=user_message,
+            classifier=verdict,
+            candidates=candidates,
+        )
+
+        # Stream a single complete chunk. The orchestrator's response handler
+        # already expects async iteration, so this keeps the contract simple
+        # while letting Phase 2 stream the synthesiser tokens directly.
+        yield self._render_markdown(recommendation)
+
+    # ----------------------------------------------------------------- retrieve
+
+    async def _retrieve(
+        self, user_message: str, verdict: ClassifierResult
+    ) -> List[dict]:
+        wants_both = verdict.needs_both_paths(self._confidence_threshold)
+        if wants_both:
+            filter_clause = None
+        elif verdict.decision == AINeedDecision.YES:
+            filter_clause = "usesAi eq true"
+        else:
+            filter_clause = "usesAi eq false"
+
+        boosted = user_message
+        if verdict.suggested_capabilities:
+            boosted = (
+                f"{user_message}\n\nCapabilities: "
+                + ", ".join(verdict.suggested_capabilities)
+            )
+
+        async with SearchClient(
+            endpoint=self._search_endpoint,
+            index_name=self._index_name,
+            credential=self.credential,
+        ) as client:
+            results = await client.search(
+                search_text=boosted,
+                vector_queries=[
+                    VectorizableTextQuery(
+                        text=boosted,
+                        k_nearest_neighbors=self._top_k * 2,
+                        fields="contentVector",
+                    )
+                ],
+                top=self._top_k,
+                filter=filter_clause,
+                select=[
+                    "id",
+                    "title",
+                    "url",
+                    "summary",
+                    "azureServices",
+                    "usesAi",
+                    "costBand",
+                    "categories",
+                ],
+                query_type="semantic",
+                semantic_configuration_name="semantic-config",
+            )
+
+            candidates: List[dict] = []
+            async for item in results:
+                candidates.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "summary": item.get("summary", ""),
+                        "uses_ai": bool(item.get("usesAi", False)),
+                        "azure_services": item.get("azureServices", []) or [],
+                        "cost_band": item.get("costBand", "unknown"),
+                        "categories": item.get("categories", []) or [],
+                        "score": item.get("@search.score", 0.0),
+                    }
+                )
+        return candidates
+
+    # ------------------------------------------------------------------ render
+
+    @staticmethod
+    def _render_markdown(rec: Recommendation) -> str:
+        lines: List[str] = []
+        v = rec.classifier
+        lines.append("## Recommendation\n")
+        lines.append(
+            f"**AI assessment:** `{v.decision.value}` "
+            f"(confidence {v.confidence:.0%})  \n"
+            f"_{v.rationale}_\n"
+        )
+        if rec.primary:
+            lines.append(f"### Primary pattern — [{rec.primary.title}]({rec.primary.url})")
+            lines.append(f"{rec.primary.summary}\n")
+            if rec.primary.azure_services:
+                lines.append(
+                    "**Key services:** " + ", ".join(rec.primary.azure_services) + "\n"
+                )
+            lines.append(f"**Cost band:** `{rec.primary.cost_band}`\n")
+        if rec.why_it_fits:
+            lines.append(f"### Why it fits\n{rec.why_it_fits}\n")
+        if rec.alternatives:
+            lines.append("### Alternatives")
+            lines.append("| Pattern | AI? | Cost | Why consider |")
+            lines.append("|---------|-----|------|--------------|")
+            for alt in rec.alternatives:
+                ai = "yes" if alt.uses_ai else "no"
+                summary = alt.summary or ""
+                summary = summary[:140] + ("…" if len(summary) > 140 else "")
+                lines.append(
+                    f"| [{alt.title}]({alt.url}) | {ai} | {alt.cost_band} | {summary} |"
+                )
+            lines.append("")
+        if rec.cost_estimate:
+            lines.append(f"### Cost estimate\n{rec.cost_estimate}\n")
+        if rec.implementation_checklist:
+            lines.append("### Implementation checklist")
+            lines.extend(f"- [ ] {step}" for step in rec.implementation_checklist)
+            lines.append("")
+        if rec.next_steps:
+            lines.append("### Next steps")
+            lines.extend(f"1. {step}" for step in rec.next_steps)
+        return "\n".join(lines)
