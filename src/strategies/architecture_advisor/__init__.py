@@ -5,13 +5,11 @@ workload needs AI, retrieves matching patterns from the Azure Architecture
 Center index, and synthesises a recommendation.
 """
 
-from .strategy import ArchitectureAdvisorStrategy
 from .classifier import AINeedsClassifier
 from .synthesizer import RecommendationSynthesizer
 from .models import AINeedDecision, ClassifierResult, ArchitectureOption, Recommendation
 
 __all__ = [
-    "ArchitectureAdvisorStrategy",
     "AINeedsClassifier",
     "RecommendationSynthesizer",
     "AINeedDecision",
