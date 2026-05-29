@@ -59,7 +59,6 @@ class RecommendationSynthesizer:
                     {"role": "system", "content": self._template},
                     {"role": "user", "content": json.dumps(user_payload)},
                 ],
-                temperature=self._temperature,
                 response_format={"type": "json_object"},
                 reasoning_effort="low",
                 max_completion_tokens=4000,

@@ -85,7 +85,6 @@ class AINeedsClassifier:
             response = await self._client.chat.completions.create(
                 model=self._deployment,
                 messages=messages,
-                temperature=self._temperature,
                 response_format={"type": "json_object"},
                 reasoning_effort="low",
                 max_completion_tokens=2000,
