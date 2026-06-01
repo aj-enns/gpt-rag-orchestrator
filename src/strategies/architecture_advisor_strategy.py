@@ -112,38 +112,63 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         state = self._load_state()
         state["dialog"].append({"role": "user", "content": user_message})
 
-        # --- Qualifying gate: ask first, recommend later.
-        gate = await self._gate.evaluate(state["dialog"])
+        # Once a recommendation has been produced, treat every further reply in
+        # the same thread as *added context that refines the same design* — not
+        # a brand-new request. We skip the clarifying-question loop and go
+        # straight to regenerating an updated recommendation.
+        already_recommended = bool(state.get("recommended"))
+
+        # The gate only sees user turns + prior clarifying questions; the large
+        # recommendation markdown is excluded so it doesn't skew consolidation.
+        gate_dialog = [m for m in state["dialog"] if m.get("kind") != "recommendation"]
+        gate = await self._gate.evaluate(gate_dialog)
         logger.info(
-            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d",
+            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d recommended=%s",
             gate.ready,
             state["rounds_asked"],
             len(gate.questions),
+            already_recommended,
         )
 
-        if not gate.ready and state["rounds_asked"] < self._max_question_rounds:
+        # Ask clarifying questions only BEFORE the first recommendation.
+        if (
+            not already_recommended
+            and not gate.ready
+            and state["rounds_asked"] < self._max_question_rounds
+        ):
             state["rounds_asked"] += 1
             questions_md = self._render_questions(gate)
             state["dialog"].append(
-                {"role": "assistant", "content": questions_md}
+                {"role": "assistant", "content": questions_md, "kind": "questions"}
             )
             self._save_state(state)
             yield questions_md
             return
 
-        # --- Enough info (or round cap reached): recommend.
-        description = gate.consolidated_description or user_message
+        # --- Enough info (or refining an existing recommendation): recommend.
+        # Always fall back to the full accumulated user context so a refinement
+        # turn never loses the earlier requirements.
+        description = gate.consolidated_description or self._joined_user_context(
+            state["dialog"]
+        )
         logger.info(
-            "[arch-advisor] recommending on consolidated description (%d chars)",
+            "[arch-advisor] %s on consolidated description (%d chars)",
+            "refining" if already_recommended else "recommending",
             len(description),
         )
 
         # Emit progress immediately so the user sees activity right away — the
         # classify + retrieve + synthesise steps below take ~30s combined.
-        yield (
-            "Got it \u2014 that's enough to go on. Analyzing Azure architecture "
-            "options and composing a recommendation\u2026\n\n"
-        )
+        if already_recommended:
+            yield (
+                "Got it \u2014 folding that into the existing design and "
+                "updating the recommendation\u2026\n\n"
+            )
+        else:
+            yield (
+                "Got it \u2014 that's enough to go on. Analyzing Azure architecture "
+                "options and composing a recommendation\u2026\n\n"
+            )
 
         verdict = await self._classifier.classify(description)
         logger.info(
@@ -163,8 +188,12 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         logger.info("[arch-advisor] synthesis complete; rendering recommendation")
 
         rendered = self._render_markdown(recommendation)
-        state["dialog"].append({"role": "assistant", "content": rendered})
-        # Reset the question budget so a follow-up inquiry can qualify afresh.
+        state["dialog"].append(
+            {"role": "assistant", "content": rendered, "kind": "recommendation"}
+        )
+        # Mark that a recommendation now exists so subsequent replies refine it.
+        state["recommended"] = True
+        # Reset the question budget (unused once recommended, but keeps state tidy).
         state["rounds_asked"] = 0
         self._save_state(state)
         yield rendered
@@ -174,18 +203,29 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
     def _load_state(self) -> dict:
         conversation = getattr(self, "conversation", None)
         if not isinstance(conversation, dict):
-            return {"dialog": [], "rounds_asked": 0}
+            return {"dialog": [], "rounds_asked": 0, "recommended": False}
         state = conversation.get("arch_advisor")
         if not isinstance(state, dict):
-            state = {"dialog": [], "rounds_asked": 0}
+            state = {"dialog": [], "rounds_asked": 0, "recommended": False}
         state.setdefault("dialog", [])
         state.setdefault("rounds_asked", 0)
+        state.setdefault("recommended", False)
         return state
 
     def _save_state(self, state: dict) -> None:
         conversation = getattr(self, "conversation", None)
         if isinstance(conversation, dict):
             conversation["arch_advisor"] = state
+
+    @staticmethod
+    def _joined_user_context(dialog: List[dict]) -> str:
+        """Concatenate every user turn so refinement keeps the full context."""
+        parts = [
+            str(m.get("content", "")).strip()
+            for m in dialog
+            if m.get("role") == "user" and str(m.get("content", "")).strip()
+        ]
+        return "\n\n".join(parts)
 
     # --------------------------------------------------------------- rendering
 
