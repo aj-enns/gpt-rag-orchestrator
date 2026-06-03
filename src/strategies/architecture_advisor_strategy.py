@@ -96,10 +96,11 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         self._confidence_threshold = float(
             cfg.get("ARCH_ADVISOR_CLASSIFIER_THRESHOLD", 0.6)
         )
-        # How many rounds of clarifying questions before recommending anyway.
-        self._max_question_rounds = int(
-            cfg.get("ARCH_ADVISOR_MAX_QUESTION_ROUNDS", 2)
-        )
+        # Hardcoded: at most this many user turns may consist of clarifying
+        # questions before we force a recommendation, regardless of gate state.
+        # Counted off the orchestrator-maintained `conversation["questions"]`
+        # list so we don't depend on a private state cache surviving Cosmos.
+        self._max_question_rounds = 2
 
     # -------------------------------------------------------- BaseAgentStrategy
 
@@ -118,25 +119,42 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         # straight to regenerating an updated recommendation.
         already_recommended = bool(state.get("recommended"))
 
+        # Count user turns from sources we don't have to maintain ourselves.
+        # `conversation["questions"]` is appended by the orchestrator BEFORE
+        # this strategy runs, so on turn N it has N entries when persistence
+        # works. We OR it with the in-memory dialog length (which always
+        # includes the message we just appended) so the cap holds even if the
+        # persisted substate is dropped between turns.
+        conv = getattr(self, "conversation", {}) or {}
+        questions_persisted = len(conv.get("questions") or [])
+        user_turns_local = sum(
+            1 for m in state["dialog"] if m.get("role") == "user"
+        )
+        user_turn_count = max(questions_persisted, user_turns_local)
+
         # The gate only sees user turns + prior clarifying questions; the large
         # recommendation markdown is excluded so it doesn't skew consolidation.
         gate_dialog = [m for m in state["dialog"] if m.get("kind") != "recommendation"]
         gate = await self._gate.evaluate(gate_dialog)
         logger.info(
-            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d recommended=%s",
+            "[arch-advisor] gate: ready=%s user_turn=%d (persisted=%d local=%d) cap=%d questions=%d recommended=%s",
             gate.ready,
-            state["rounds_asked"],
+            user_turn_count,
+            questions_persisted,
+            user_turns_local,
+            self._max_question_rounds,
             len(gate.questions),
             already_recommended,
         )
 
-        # Ask clarifying questions only BEFORE the first recommendation.
+        # Ask clarifying questions only BEFORE the first recommendation, and
+        # only while we are still inside the hardcoded round budget. The 3rd
+        # user message forces a recommendation regardless of gate state.
         if (
             not already_recommended
             and not gate.ready
-            and state["rounds_asked"] < self._max_question_rounds
+            and user_turn_count <= self._max_question_rounds
         ):
-            state["rounds_asked"] += 1
             questions_md = self._render_questions(gate)
             state["dialog"].append(
                 {"role": "assistant", "content": questions_md, "kind": "questions"}
@@ -193,8 +211,6 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         )
         # Mark that a recommendation now exists so subsequent replies refine it.
         state["recommended"] = True
-        # Reset the question budget (unused once recommended, but keeps state tidy).
-        state["rounds_asked"] = 0
         self._save_state(state)
         yield rendered
 
