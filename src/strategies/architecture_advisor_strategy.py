@@ -112,16 +112,27 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
         state = self._load_state()
         state["dialog"].append({"role": "user", "content": user_message})
 
+        # Once a recommendation has been produced, never re-enter the
+        # clarifying-question loop: subsequent replies go straight to an
+        # updated recommendation. This caps questions at _max_question_rounds
+        # for the lifetime of the conversation.
+        already_recommended = bool(state.get("recommended"))
+
         # --- Qualifying gate: ask first, recommend later.
         gate = await self._gate.evaluate(state["dialog"])
         logger.info(
-            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d",
+            "[arch-advisor] gate: ready=%s rounds_asked=%d questions=%d recommended=%s",
             gate.ready,
             state["rounds_asked"],
             len(gate.questions),
+            already_recommended,
         )
 
-        if not gate.ready and state["rounds_asked"] < self._max_question_rounds:
+        if (
+            not already_recommended
+            and not gate.ready
+            and state["rounds_asked"] < self._max_question_rounds
+        ):
             state["rounds_asked"] += 1
             questions_md = self._render_questions(gate)
             state["dialog"].append(
@@ -164,8 +175,9 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
 
         rendered = self._render_markdown(recommendation)
         state["dialog"].append({"role": "assistant", "content": rendered})
-        # Reset the question budget so a follow-up inquiry can qualify afresh.
-        state["rounds_asked"] = 0
+        # Mark that a recommendation now exists so subsequent replies refine it
+        # instead of re-triggering the clarifying-question loop.
+        state["recommended"] = True
         self._save_state(state)
         yield rendered
 
@@ -174,12 +186,13 @@ class ArchitectureAdvisorStrategy(BaseAgentStrategy):
     def _load_state(self) -> dict:
         conversation = getattr(self, "conversation", None)
         if not isinstance(conversation, dict):
-            return {"dialog": [], "rounds_asked": 0}
+            return {"dialog": [], "rounds_asked": 0, "recommended": False}
         state = conversation.get("arch_advisor")
         if not isinstance(state, dict):
-            state = {"dialog": [], "rounds_asked": 0}
+            state = {"dialog": [], "rounds_asked": 0, "recommended": False}
         state.setdefault("dialog", [])
         state.setdefault("rounds_asked", 0)
+        state.setdefault("recommended", False)
         return state
 
     def _save_state(self, state: dict) -> None:
